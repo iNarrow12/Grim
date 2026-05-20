@@ -1,0 +1,7 @@
+svchost.exe
+explorer.exe
+winlogon.exe
+lsass.exe
+System
+NVIDIA
+AMD
