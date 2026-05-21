@@ -5,3 +5,4 @@ lsass.exe
 System
 NVIDIA
 AMD
+INTEL
