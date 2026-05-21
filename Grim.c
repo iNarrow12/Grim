@@ -1,32 +1,44 @@
 #define _WIN32_WINNT 0x0600
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
+
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <wchar.h>
 #include <string.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <shlwapi.h>
+#include <wincrypt.h>
+#include <winver.h>
 
-#define SLEEP_MS 20
-#define HASH_SIZE 4096
-#define MAX_BLACKLIST_ITEMS 100
-#define MAX_WHITELIST_ITEMS 100
-#define MAX_STR_LEN 256
-#define CLEANUP_INTERVAL_MS 300000
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "version.lib")
 
-wchar_t* blacklist[MAX_BLACKLIST_ITEMS];
-int blacklist_count = 0;
+#define SLEEP_MS                10
+#define HASH_SIZE               4096
+#define MAX_BLACKLIST_ITEMS     300
+#define MAX_WHITELIST_ITEMS     300
+#define MAX_STR_LEN             512
 
-wchar_t* whitelist[MAX_WHITELIST_ITEMS];
-int whitelist_count = 0;
+// ====================== GLOBALS ======================
+static wchar_t* blacklist[MAX_BLACKLIST_ITEMS];
+static int blacklist_count = 0;
 
-DWORD* handled_pids = NULL;
-size_t handled_count = 0;
-size_t handled_capacity = 0;
+static wchar_t* whitelist[MAX_WHITELIST_ITEMS];
+static int whitelist_count = 0;
 
-DWORD* tainted_pids = NULL;
-size_t tainted_count = 0;
-size_t tainted_capacity = 0;
+static DWORD* handled_pids = NULL;
+static size_t handled_count = 0;
+static size_t handled_capacity = 0;
+
+static DWORD* tainted_pids = NULL;
+static size_t tainted_count = 0;
+static size_t tainted_capacity = 0;
 
 typedef struct ProcEntry {
     DWORD pid;
@@ -36,33 +48,298 @@ typedef struct ProcEntry {
 } ProcEntry;
 
 static ProcEntry* hash_table[HASH_SIZE] = { NULL };
+static FILE* log_file = NULL;
 
-static inline unsigned hash(DWORD pid) {
+// ====================== UTILITIES ======================
+static inline unsigned hash_func(DWORD pid) {
     return pid & (HASH_SIZE - 1);
 }
 
-void insert_proc(DWORD pid, DWORD ppid, const wchar_t* name) {
-    unsigned idx = hash(pid);
-    ProcEntry* e = (ProcEntry*)malloc(sizeof(ProcEntry));
-    if (!e) return;
-    e->pid = pid;
-    e->ppid = ppid;
-    wcsncpy_s(e->name, MAX_PATH, name, _TRUNCATE);
-    e->next = hash_table[idx];
-    hash_table[idx] = e;
+static void fast_log(const char* fmt, ...) {
+    if (!log_file) log_file = fopen("grim_monitor.log", "a");
+    if (!log_file) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(log_file, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(log_file, fmt, args);
+    va_end(args);
+    fflush(log_file);
 }
 
-ProcEntry* find_proc(DWORD pid) {
-    unsigned idx = hash(pid);
-    ProcEntry* cur = hash_table[idx];
-    while (cur) {
-        if (cur->pid == pid) return cur;
-        cur = cur->next;
+// ====================== CLEANUP ======================
+static void free_lists(void) {
+    for (int i = 0; i < blacklist_count; i++) free(blacklist[i]);
+    for (int i = 0; i < whitelist_count; i++) free(whitelist[i]);
+    blacklist_count = whitelist_count = 0;
+}
+
+static void free_previous(ProcEntry* prev[HASH_SIZE]) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        ProcEntry* cur = prev[i];
+        while (cur) {
+            ProcEntry* next = cur->next;
+            free(cur);
+            cur = next;
+        }
+        prev[i] = NULL;
     }
+}
+
+static void cleanup_all(void) {
+    if (log_file) {
+        fclose(log_file);
+        log_file = NULL;
+    }
+    free_lists();
+    free(handled_pids);
+    free(tainted_pids);
+    // hash_table cleaned separately
+}
+
+// ====================== LISTS ======================
+static void load_list(const char* filename, wchar_t** list, int* count, int max_items) {
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        fast_log("Warning: %s not found\n", filename);
+        return;
+    }
+    char line[MAX_STR_LEN];
+    while (fgets(line, sizeof(line), f) && *count < max_items) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
+        if (len == 0 || line[0] == '#') continue;
+
+        wchar_t* wline = malloc((len + 1) * sizeof(wchar_t));
+        if (wline) {
+            mbstowcs(wline, line, len + 1);
+            list[*count] = wline;
+            (*count)++;
+        }
+    }
+    fclose(f);
+}
+
+static int matches_list(const wchar_t* text, wchar_t** list, int count) {
+    if (!text || !*text) return 0;
+    for (int i = 0; i < count; i++) {
+        if (StrStrIW(text, list[i]) != NULL) return 1;
+    }
+    return 0;
+}
+
+// ====================== PROCESS CONTROL ======================
+static void suspend_process(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+
+    THREADENTRY32 te = { sizeof(te) };
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (hThread) {
+                    SuspendThread(hThread);
+                    CloseHandle(hThread);
+                }
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+static void kill_process(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (h) {
+        TerminateProcess(h, 0);
+        CloseHandle(h);
+    }
+}
+
+static void collect_descendants(DWORD parent, DWORD** out, size_t* count, size_t* cap) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        for (ProcEntry* e = hash_table[i]; e; e = e->next) {
+            if (e->ppid == parent && e->pid != parent) {
+                if (*count >= *cap) {
+                    *cap = *cap ? *cap * 2 : 32;
+                    *out = (DWORD*)realloc(*out, *cap * sizeof(DWORD));
+                }
+                (*out)[(*count)++] = e->pid;
+                collect_descendants(e->pid, out, count, cap);
+            }
+        }
+    }
+}
+
+static void kill_process_tree(DWORD root) {
+    DWORD* descendants = NULL;
+    size_t count = 0, cap = 0;
+    collect_descendants(root, &descendants, &count, &cap);
+    for (size_t i = 0; i < count; i++) kill_process(descendants[i]);
+    kill_process(root);
+    free(descendants);
+}
+
+// ====================== METADATA ======================
+static wchar_t* get_digital_signer(const wchar_t* path) {
+    wchar_t* signer = NULL;
+    HCERTSTORE hStore = NULL;
+    HCRYPTMSG hMsg = NULL;
+    DWORD enc, type, fmt;
+
+    if (CryptQueryObject(CERT_QUERY_OBJECT_FILE, path,
+        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_FORMAT_FLAG_BINARY, 0,
+        &enc, &type, &fmt, &hStore, &hMsg, NULL) && hStore) {
+
+        PCCERT_CONTEXT pCert = CertFindCertificateInStore(hStore,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_ANY, NULL, NULL);
+        if (pCert) {
+            wchar_t name[512] = {0};
+            if (CertGetNameStringW(pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, name, 512) > 1)
+                signer = _wcsdup(name);
+            CertFreeCertificateContext(pCert);
+        }
+        CertCloseStore(hStore, 0);
+    }
+    if (hMsg) CryptMsgClose(hMsg);
+    return signer;
+}
+
+static wchar_t* get_version_string(const wchar_t* path, const wchar_t* field) {
+    DWORD sz = GetFileVersionInfoSizeW(path, NULL);
+    if (!sz) return NULL;
+    void* data = malloc(sz);
+    if (!data) return NULL;
+    if (!GetFileVersionInfoW(path, 0, sz, data)) {
+        free(data);
+        return NULL;
+    }
+
+    wchar_t* ret = NULL;
+    struct LANGANDCODEPAGE { WORD lang; WORD cp; } *trans;
+    UINT transSize = 0;
+
+    if (VerQueryValueW(data, L"\\VarFileInfo\\Translation", (LPVOID*)&trans, &transSize) && transSize >= sizeof(*trans)) {
+        wchar_t sub[256];
+        swprintf_s(sub, 256, L"\\StringFileInfo\\%04X%04X\\%ls", trans[0].lang, trans[0].cp, field);
+        wchar_t* val = NULL;
+        UINT valLen = 0;
+        if (VerQueryValueW(data, sub, (LPVOID*)&val, &valLen) && val && valLen > 0) {
+            size_t len = wcslen(val) + 1;
+            ret = malloc(len * sizeof(wchar_t));
+            if (ret) wcscpy_s(ret, len, val);
+        }
+    }
+    free(data);
+    return ret;
+}
+
+typedef struct {
+    wchar_t name[MAX_PATH];
+    wchar_t path[MAX_PATH];
+    wchar_t company[256];
+    wchar_t product[256];
+    wchar_t description[256];
+    wchar_t comment[256];
+    wchar_t signer[256];
+} ProcMetadata;
+
+static void get_process_metadata(DWORD pid, ProcMetadata* meta) {
+    memset(meta, 0, sizeof(ProcMetadata));
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+
+    DWORD sz = MAX_PATH;
+    QueryFullProcessImageNameW(hProc, 0, meta->path, &sz);
+    CloseHandle(hProc);
+
+    if (meta->path[0] == L'\0') return;
+
+    wchar_t* tmp;
+    tmp = get_version_string(meta->path, L"CompanyName");    if (tmp) { wcsncpy_s(meta->company, 256, tmp, _TRUNCATE); free(tmp); }
+    tmp = get_version_string(meta->path, L"ProductName");     if (tmp) { wcsncpy_s(meta->product, 256, tmp, _TRUNCATE); free(tmp); }
+    tmp = get_version_string(meta->path, L"FileDescription"); if (tmp) { wcsncpy_s(meta->description, 256, tmp, _TRUNCATE); free(tmp); }
+    tmp = get_version_string(meta->path, L"Comments");        if (tmp) { wcsncpy_s(meta->comment, 256, tmp, _TRUNCATE); free(tmp); }
+    tmp = get_digital_signer(meta->path);                     if (tmp) { wcsncpy_s(meta->signer, 256, tmp, _TRUNCATE); free(tmp); }
+}
+
+static int is_whitelisted(ProcMetadata* meta) {
+    if (matches_list(meta->name, whitelist, whitelist_count)) return 1;
+    if (matches_list(meta->path, whitelist, whitelist_count)) return 1;
+    if (matches_list(meta->company, whitelist, whitelist_count)) return 1;
+    if (matches_list(meta->product, whitelist, whitelist_count)) return 1;
+    if (matches_list(meta->description, whitelist, whitelist_count)) return 1;
+    if (matches_list(meta->comment, whitelist, whitelist_count)) return 1;
+    if (matches_list(meta->signer, whitelist, whitelist_count)) return 1;
+    return 0;
+}
+
+static int matches_blacklist(ProcMetadata* meta) {
+    if (matches_list(meta->name, blacklist, blacklist_count)) return 1;
+    if (matches_list(meta->path, blacklist, blacklist_count)) return 1;
+    if (matches_list(meta->company, blacklist, blacklist_count)) return 1;
+    if (matches_list(meta->product, blacklist, blacklist_count)) return 1;
+    if (matches_list(meta->description, blacklist, blacklist_count)) return 1;
+    if (matches_list(meta->comment, blacklist, blacklist_count)) return 1;
+    if (matches_list(meta->signer, blacklist, blacklist_count)) return 1;
+    return 0;
+}
+
+// ====================== HANDLED / TAINTED ======================
+static int is_handled(DWORD pid) {
+    for (size_t i = 0; i < handled_count; i++)
+        if (handled_pids[i] == pid) return 1;
+    return 0;
+}
+
+static void add_handled(DWORD pid) {
+    if (is_handled(pid)) return;
+    if (handled_count >= handled_capacity) {
+        handled_capacity = handled_capacity ? handled_capacity * 2 : 128;
+        handled_pids = (DWORD*)realloc(handled_pids, handled_capacity * sizeof(DWORD));
+    }
+    handled_pids[handled_count++] = pid;
+}
+
+static int is_tainted(DWORD pid) {
+    for (size_t i = 0; i < tainted_count; i++)
+        if (tainted_pids[i] == pid) return 1;
+    return 0;
+}
+
+static void add_tainted(DWORD pid) {
+    if (is_tainted(pid)) return;
+    if (tainted_count >= tainted_capacity) {
+        tainted_capacity = tainted_capacity ? tainted_capacity * 2 : 64;
+        tainted_pids = (DWORD*)realloc(tainted_pids, tainted_capacity * sizeof(DWORD));
+    }
+    tainted_pids[tainted_count++] = pid;
+}
+
+static ProcEntry* find_proc(DWORD pid) {
+    unsigned idx = hash_func(pid);
+    for (ProcEntry* e = hash_table[idx]; e; e = e->next)
+        if (e->pid == pid) return e;
     return NULL;
 }
 
-void clear_hash_table(void) {
+static int has_tainted_ancestor(DWORD pid) {
+    DWORD cur = pid;
+    while (cur != 0) {
+        if (is_tainted(cur)) return 1;
+        ProcEntry* e = find_proc(cur);
+        if (!e) break;
+        cur = e->ppid;
+    }
+    return 0;
+}
+
+// ====================== HASH TABLE ======================
+static void clear_hash_table(void) {
     for (int i = 0; i < HASH_SIZE; i++) {
         ProcEntry* cur = hash_table[i];
         while (cur) {
@@ -74,305 +351,58 @@ void clear_hash_table(void) {
     }
 }
 
-void build_hash_from_snapshot(HANDLE snap) {
+static void build_hash_from_snapshot(HANDLE snap) {
     clear_hash_table();
-    PROCESSENTRY32W pe;
-    pe.dwSize = sizeof(pe);
+    PROCESSENTRY32W pe = { sizeof(pe) };
     if (!Process32FirstW(snap, &pe)) return;
     do {
-        insert_proc(pe.th32ProcessID, pe.th32ParentProcessID, pe.szExeFile);
+        unsigned idx = hash_func(pe.th32ProcessID);
+        ProcEntry* e = malloc(sizeof(ProcEntry));
+        if (e) {
+            e->pid = pe.th32ProcessID;
+            e->ppid = pe.th32ParentProcessID;
+            wcsncpy_s(e->name, MAX_PATH, pe.szExeFile, _TRUNCATE);
+            e->next = hash_table[idx];
+            hash_table[idx] = e;
+        }
     } while (Process32NextW(snap, &pe));
 }
 
-void load_list(const char* filename, wchar_t** list, int* count, int max_items) {
-    FILE* f = fopen(filename, "r");
-    if (!f) return;
-    char line[MAX_STR_LEN];
-    while (fgets(line, sizeof(line), f) && *count < max_items) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
-        if (len == 0) continue;
-        wchar_t* wline = malloc((len+1) * sizeof(wchar_t));
-        if (wline) {
-            mbstowcs(wline, line, len+1);
-            list[*count] = wline;
-            (*count)++;
-        }
+// ====================== CTRL HANDLER ======================
+static BOOL WINAPI CtrlHandler(DWORD ctrlType) {
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_CLOSE_EVENT) {
+        fast_log("Shutdown received. Cleaning up...\n");
+        cleanup_all();
+        exit(0);
     }
-    fclose(f);
+    return FALSE;
 }
 
-void free_lists(void) {
-    for (int i = 0; i < blacklist_count; i++) free(blacklist[i]);
-    for (int i = 0; i < whitelist_count; i++) free(whitelist[i]);
-}
-
-int matches_list(const wchar_t* text, wchar_t** list, int list_count) {
-    if (!text || !*text) return 0;
-    for (int i = 0; i < list_count; i++) {
-        if (wcsstr(text, list[i]) != NULL) return 1;
-    }
-    return 0;
-}
-
-void cleanup_stale_arrays(void) {
-    size_t new_count = 0;
-    for (size_t i = 0; i < handled_count; i++) {
-        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, handled_pids[i]);
-        if (h) {
-            CloseHandle(h);
-            handled_pids[new_count++] = handled_pids[i];
-        }
-    }
-    handled_count = new_count;
-
-    new_count = 0;
-    for (size_t i = 0; i < tainted_count; i++) {
-        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, tainted_pids[i]);
-        if (h) {
-            CloseHandle(h);
-            tainted_pids[new_count++] = tainted_pids[i];
-        }
-    }
-    tainted_count = new_count;
-}
-
-void suspend_process_native(DWORD pid) {
-    HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hThreadSnap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te;
-    te.dwSize = sizeof(te);
-    if (Thread32First(hThreadSnap, &te)) {
-        do {
-            if (te.th32OwnerProcessID == pid) {
-                HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-                if (hThread) {
-                    SuspendThread(hThread);
-                    CloseHandle(hThread);
-                }
-            }
-        } while (Thread32Next(hThreadSnap, &te));
-    }
-    CloseHandle(hThreadSnap);
-}
-
-void kill_process_native(DWORD pid) {
-    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-    if (hProcess) {
-        TerminateProcess(hProcess, 0);
-        CloseHandle(hProcess);
-    }
-}
-
-static void collect_descendants(DWORD parent, DWORD** descendants, size_t* count, size_t* cap) {
-    for (int i = 0; i < HASH_SIZE; i++) {
-        for (ProcEntry* e = hash_table[i]; e; e = e->next) {
-            if (e->ppid == parent && e->pid != parent) {
-                if (*count >= *cap) {
-                    *cap = *cap ? *cap * 2 : 16;
-                    *descendants = (DWORD*)realloc(*descendants, *cap * sizeof(DWORD));
-                }
-                (*descendants)[(*count)++] = e->pid;
-                collect_descendants(e->pid, descendants, count, cap);
-            }
-        }
-    }
-}
-
-void kill_process_tree_native(DWORD root_pid) {
-    DWORD* descendants = NULL;
-    size_t desc_count = 0;
-    size_t desc_cap = 0;
-    collect_descendants(root_pid, &descendants, &desc_count, &desc_cap);
-    for (size_t i = 0; i < desc_count; i++) {
-        kill_process_native(descendants[i]);
-    }
-    kill_process_native(root_pid);
-    free(descendants);
-}
-
-wchar_t* get_file_version_string(const wchar_t* file_path, const wchar_t* field) {
-    DWORD ver_size = GetFileVersionInfoSizeW(file_path, NULL);
-    if (ver_size == 0) return NULL;
-    void* ver_data = malloc(ver_size);
-    if (!ver_data) return NULL;
-    if (!GetFileVersionInfoW(file_path, 0, ver_size, ver_data)) {
-        free(ver_data);
-        return NULL;
-    }
-    wchar_t* ret = NULL;
-    struct LANGANDCODEPAGE { WORD wLanguage; WORD wCodePage; } *lpTranslate;
-    UINT cbTranslate = 0;
-    if (VerQueryValueW(ver_data, L"\\VarFileInfo\\Translation", (LPVOID*)&lpTranslate, &cbTranslate)) {
-        if (cbTranslate >= sizeof(struct LANGANDCODEPAGE)) {
-            wchar_t subblock[256];
-            swprintf_s(subblock, sizeof(subblock)/sizeof(wchar_t),
-                       L"\\StringFileInfo\\%04X%04X\\%ls",
-                       lpTranslate[0].wLanguage, lpTranslate[0].wCodePage, field);
-            wchar_t* val = NULL;
-            UINT val_len = 0;
-            if (VerQueryValueW(ver_data, subblock, (LPVOID*)&val, &val_len)) {
-                if (val && val_len > 0) {
-                    size_t len = wcslen(val) + 1;
-                    ret = (wchar_t*)malloc(len * sizeof(wchar_t));
-                    if (ret) wcscpy_s(ret, len, val);
-                }
-            }
-        }
-    }
-    free(ver_data);
-    return ret;
-}
-
-typedef struct {
-    wchar_t name[MAX_PATH];
-    wchar_t path[MAX_PATH];
-    wchar_t company[256];
-    wchar_t product[256];
-    wchar_t description[256];
-} ProcMetadata;
-
-void get_process_metadata(DWORD pid, ProcMetadata* meta) {
-    meta->path[0] = L'\0';
-    meta->company[0] = L'\0';
-    meta->product[0] = L'\0';
-    meta->description[0] = L'\0';
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (h) {
-        DWORD sz = MAX_PATH;
-        QueryFullProcessImageNameW(h, 0, meta->path, &sz);
-        CloseHandle(h);
-    }
-    if (meta->path[0] == L'\0') return;
-    wchar_t* tmp = get_file_version_string(meta->path, L"CompanyName");
-    if (tmp) { wcsncpy_s(meta->company, 256, tmp, _TRUNCATE); free(tmp); }
-    tmp = get_file_version_string(meta->path, L"ProductName");
-    if (tmp) { wcsncpy_s(meta->product, 256, tmp, _TRUNCATE); free(tmp); }
-    tmp = get_file_version_string(meta->path, L"FileDescription");
-    if (tmp) { wcsncpy_s(meta->description, 256, tmp, _TRUNCATE); free(tmp); }
-}
-
-int is_handled(DWORD pid) {
-    for (size_t i = 0; i < handled_count; i++)
-        if (handled_pids[i] == pid) return 1;
-    return 0;
-}
-
-void add_handled(DWORD pid) {
-    if (is_handled(pid)) return;
-    if (handled_count >= handled_capacity) {
-        handled_capacity = handled_capacity ? handled_capacity * 2 : 64;
-        handled_pids = (DWORD*)realloc(handled_pids, handled_capacity * sizeof(DWORD));
-    }
-    handled_pids[handled_count++] = pid;
-}
-
-void add_tainted(DWORD pid) {
-    for (size_t i = 0; i < tainted_count; i++)
-        if (tainted_pids[i] == pid) return;
-    if (tainted_count >= tainted_capacity) {
-        tainted_capacity = tainted_capacity ? tainted_capacity * 2 : 64;
-        tainted_pids = (DWORD*)realloc(tainted_pids, tainted_capacity * sizeof(DWORD));
-    }
-    tainted_pids[tainted_count++] = pid;
-}
-
-int is_tainted(DWORD pid) {
-    for (size_t i = 0; i < tainted_count; i++)
-        if (tainted_pids[i] == pid) return 1;
-    return 0;
-}
-
-int has_tainted_ancestor(DWORD pid) {
-    DWORD cur = pid;
-    while (cur != 0) {
-        if (is_tainted(cur)) return 1;
-        ProcEntry* e = find_proc(cur);
-        if (!e) break;
-        cur = e->ppid;
-    }
-    return 0;
-}
-
-int is_whitelisted(ProcMetadata* meta) {
-    if (matches_list(meta->name, whitelist, whitelist_count)) return 1;
-    if (matches_list(meta->path, whitelist, whitelist_count)) return 1;
-    if (matches_list(meta->company, whitelist, whitelist_count)) return 1;
-    if (matches_list(meta->product, whitelist, whitelist_count)) return 1;
-    if (matches_list(meta->description, whitelist, whitelist_count)) return 1;
-    return 0;
-}
-
-int matches_blacklist(ProcMetadata* meta) {
-    if (matches_list(meta->name, blacklist, blacklist_count)) return 1;
-    if (matches_list(meta->path, blacklist, blacklist_count)) return 1;
-    if (matches_list(meta->company, blacklist, blacklist_count)) return 1;
-    if (matches_list(meta->product, blacklist, blacklist_count)) return 1;
-    if (matches_list(meta->description, blacklist, blacklist_count)) return 1;
-    return 0;
-}
-
-ProcEntry* copy_proc_entry(const ProcEntry* src) {
-    ProcEntry* dst = (ProcEntry*)malloc(sizeof(ProcEntry));
-    if (!dst) return NULL;
-    dst->pid = src->pid;
-    dst->ppid = src->ppid;
-    wcsncpy_s(dst->name, MAX_PATH, src->name, _TRUNCATE);
-    dst->next = NULL;
-    return dst;
-}
-
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+// ====================== MAIN ======================
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show) {
     FreeConsole();
+    SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
     load_list("blacklist.txt", blacklist, &blacklist_count, MAX_BLACKLIST_ITEMS);
     load_list("whitelist.txt", whitelist, &whitelist_count, MAX_WHITELIST_ITEMS);
 
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 1;
-    build_hash_from_snapshot(snap);
-    CloseHandle(snap);
+    fast_log("=== Grim AV Install Killer (10ms ULTRA MODE) ===\n");
+    fast_log("Blacklist: %d | Whitelist: %d\n", blacklist_count, whitelist_count);
 
-    for (int i = 0; i < HASH_SIZE; i++) {
-        for (ProcEntry* e = hash_table[i]; e; e = e->next) {
-            if (is_handled(e->pid)) continue;
-            ProcMetadata meta;
-            wcscpy_s(meta.name, MAX_PATH, e->name);
-            get_process_metadata(e->pid, &meta);
-            if (is_whitelisted(&meta)) continue;
-            if (matches_blacklist(&meta)) {
-                add_tainted(e->pid);
-                suspend_process_native(e->pid);
-                kill_process_tree_native(e->pid);
-                add_handled(e->pid);
-            }
-        }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        build_hash_from_snapshot(snap);
+        CloseHandle(snap);
     }
 
     ProcEntry* previous[HASH_SIZE] = { NULL };
-    for (int i = 0; i < HASH_SIZE; i++) {
-        for (ProcEntry* e = hash_table[i]; e; e = e->next) {
-            ProcEntry* copy = copy_proc_entry(e);
-            if (copy) {
-                unsigned idx = hash(e->pid);
-                copy->next = previous[idx];
-                previous[idx] = copy;
-            }
-        }
-    }
-
-    DWORD last_cleanup = GetTickCount();
 
     while (1) {
         Sleep(SLEEP_MS);
 
-        if (GetTickCount() - last_cleanup >= CLEANUP_INTERVAL_MS) {
-            cleanup_stale_arrays();
-            last_cleanup = GetTickCount();
-        }
-
         snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap == INVALID_HANDLE_VALUE) continue;
+
         build_hash_from_snapshot(snap);
         CloseHandle(snap);
 
@@ -381,55 +411,56 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 DWORD pid = cur->pid;
                 if (is_handled(pid)) continue;
 
-                int found = 0;
-                unsigned prev_idx = hash(pid);
-                for (ProcEntry* prv = previous[prev_idx]; prv; prv = prv->next) {
-                    if (prv->pid == pid) { found = 1; break; }
+                int is_new = 1;
+                unsigned pidx = hash_func(pid);
+                for (ProcEntry* p = previous[pidx]; p; p = p->next) {
+                    if (p->pid == pid) { is_new = 0; break; }
                 }
-                if (!found) {
-                    ProcMetadata meta;
-                    wcscpy_s(meta.name, MAX_PATH, cur->name);
-                    get_process_metadata(pid, &meta);
-                    if (is_whitelisted(&meta)) continue;
+                if (!is_new) continue;
 
-                    if (matches_blacklist(&meta)) {
-                        add_tainted(pid);
-                        suspend_process_native(pid);
-                        kill_process_tree_native(pid);
-                        add_handled(pid);
-                    } else if (has_tainted_ancestor(pid)) {
-                        suspend_process_native(pid);
-                        kill_process_tree_native(pid);
-                        add_handled(pid);
-                    }
+                ProcMetadata meta;
+                wcsncpy_s(meta.name, MAX_PATH, cur->name, _TRUNCATE);
+                get_process_metadata(pid, &meta);
+
+                if (is_whitelisted(&meta)) {
+                    add_handled(pid);
+                    continue;
+                }
+
+                if (matches_blacklist(&meta)) {
+                    fast_log("BLACKLIST HIT → %ls (PID: %lu)\n", cur->name, pid);
+                    add_tainted(pid);
+                    suspend_process(pid);
+                    kill_process_tree(pid);
+                    add_handled(pid);
+                }
+                else if (has_tainted_ancestor(pid)) {
+                    fast_log("CHILD OF TAINTED → %ls (PID: %lu)\n", cur->name, pid);
+                    suspend_process(pid);
+                    kill_process_tree(pid);
+                    add_handled(pid);
                 }
             }
         }
 
-        for (int i = 0; i < HASH_SIZE; i++) {
-            ProcEntry* cur = previous[i];
-            while (cur) {
-                ProcEntry* next = cur->next;
-                free(cur);
-                cur = next;
-            }
-            previous[i] = NULL;
-        }
+        // Clean up previous snapshot
+        free_previous(previous);
+
+        // Copy current snapshot to previous
         for (int i = 0; i < HASH_SIZE; i++) {
             for (ProcEntry* e = hash_table[i]; e; e = e->next) {
-                ProcEntry* copy = copy_proc_entry(e);
+                ProcEntry* copy = malloc(sizeof(ProcEntry));
                 if (copy) {
-                    unsigned idx = hash(e->pid);
-                    copy->next = previous[idx];
-                    previous[idx] = copy;
+                    copy->pid = e->pid;
+                    copy->ppid = e->ppid;
+                    wcsncpy_s(copy->name, MAX_PATH, e->name, _TRUNCATE);
+                    copy->next = previous[i];
+                    previous[i] = copy;
                 }
             }
         }
     }
 
-    free_lists();
-    free(handled_pids);
-    free(tainted_pids);
-    clear_hash_table();
+    cleanup_all();
     return 0;
 }
